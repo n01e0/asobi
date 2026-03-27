@@ -66,6 +66,50 @@ pub fn latest_session_id() -> Result<Option<String>> {
     Ok(newest.map(|(_, id)| id))
 }
 
+pub fn list_sessions() -> Result<Vec<(String, String)>> {
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut sessions = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl")
+            && let Ok(meta) = entry.metadata()
+        {
+            let id = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let mtime = meta
+                .modified()
+                .unwrap_or(std::time::UNIX_EPOCH)
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let datetime = format_epoch(mtime);
+            sessions.push((id, datetime));
+        }
+    }
+    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+    Ok(sessions)
+}
+
+fn format_epoch(secs: u64) -> String {
+    let s = secs % 60;
+    let m = (secs / 60) % 60;
+    let h = (secs / 3600) % 24;
+    let days = secs / 86400;
+    let y = 1970 + days / 365;
+    let remaining_days = days % 365;
+    let month = remaining_days / 30 + 1;
+    let day = remaining_days % 30 + 1;
+    format!("{y:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02} UTC")
+}
+
 pub async fn load(session_id: &str) -> Result<Vec<Message>> {
     let path = session_path(session_id);
     if !path.exists() {

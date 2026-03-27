@@ -19,6 +19,7 @@ pub enum AgentEvent {
     Text(String),
     ToolCall { name: String, input: String },
     ToolResult { name: String, output: String },
+    Usage { input_tokens: i32, output_tokens: i32 },
     TurnEnd,
     Error(String),
 }
@@ -239,6 +240,14 @@ impl Agent {
                             }
                         }
                         ConverseStreamOutput::MessageStop(_) => break,
+                        ConverseStreamOutput::Metadata(meta) => {
+                            if let Some(usage) = meta.usage() {
+                                let _ = tx.send(AgentEvent::Usage {
+                                    input_tokens: usage.input_tokens(),
+                                    output_tokens: usage.output_tokens(),
+                                });
+                            }
+                        }
                         _ => {}
                     }
                 }

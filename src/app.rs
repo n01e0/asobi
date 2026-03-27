@@ -23,6 +23,7 @@ pub enum ChatEntry {
     AssistantText(String),
     ToolCall { name: String, input: String },
     ToolResult { name: String, output: String },
+    System(String),
     Error(String),
 }
 
@@ -41,6 +42,8 @@ pub struct App {
     input_history: Vec<String>,
     history_index: Option<usize>,
     saved_input: String,
+    pub total_input_tokens: i64,
+    pub total_output_tokens: i64,
 }
 
 impl App {
@@ -60,6 +63,8 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             saved_input: String::new(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
         }
     }
 
@@ -110,6 +115,10 @@ impl App {
             AgentEvent::TurnEnd => {
                 self.flush_streaming();
                 self.is_streaming = false;
+            }
+            AgentEvent::Usage { input_tokens, output_tokens } => {
+                self.total_input_tokens += input_tokens as i64;
+                self.total_output_tokens += output_tokens as i64;
             }
             AgentEvent::Error(msg) => {
                 self.flush_streaming();
@@ -300,6 +309,14 @@ pub fn render(app: &mut App, frame: &mut Frame) {
                     ),
                     Span::styled(preview, Style::default().fg(Color::DarkGray)),
                 ]));
+            }
+            ChatEntry::System(msg) => {
+                for line in msg.lines() {
+                    lines.push(Line::from(Span::styled(
+                        line.to_string(),
+                        Style::default().fg(Color::Magenta),
+                    )));
+                }
             }
             ChatEntry::Error(msg) => {
                 lines.push(Line::from(Span::styled(

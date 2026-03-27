@@ -166,6 +166,9 @@ async fn run_non_interactive(
                 let preview: String = output.chars().take(200).collect();
                 writeln!(stderr, "[result] {name}: {preview}")?;
             }
+            agent::AgentEvent::Usage { input_tokens, output_tokens } => {
+                writeln!(stderr, "[usage] input={input_tokens} output={output_tokens}")?;
+            }
             agent::AgentEvent::Error(msg) => {
                 writeln!(stderr, "[error] {msg}")?;
                 has_error = true;
@@ -208,8 +211,9 @@ async fn run_interactive(
     let region = resolved.region;
     let system_prompt = resolved.system_prompt;
     let sid = session_id.to_string();
+    let agent_registry = Arc::clone(&registry);
     tokio::spawn(async move {
-        let mut agent = match agent::Agent::new(model_id, region, system_prompt, sid, restore, registry).await {
+        let mut agent = match agent::Agent::new(model_id, region, system_prompt, sid, restore, agent_registry).await {
             Ok(a) => a,
             Err(e) => {
                 let _ = agent_tx.send(agent::AgentEvent::Error(format!("{e:#}")));
@@ -270,9 +274,45 @@ async fn run_interactive(
                                     match key.code {
                                         KeyCode::Enter => {
                                             let input = app.take_input();
-                                            if input.trim() == "/quit" {
+                                            let trimmed = input.trim();
+                                            if trimmed == "/quit" {
                                                 break;
-                                            } else if !input.trim().is_empty() {
+                                            } else if trimmed == "/tools" {
+                                                let defs = registry.tool_definitions();
+                                                let mut msg = format!("{} tools available:\n", defs.len());
+                                                for tool in &defs {
+                                                    if let aws_sdk_bedrockruntime::types::Tool::ToolSpec(spec) = tool {
+                                                        msg.push_str(&format!("  {} - {}\n", spec.name(), spec.description().unwrap_or("")));
+                                                    }
+                                                }
+                                                app.chat.push(app::ChatEntry::System(msg));
+                                            } else if trimmed == "/usage" {
+                                                let total = app.total_input_tokens + app.total_output_tokens;
+                                                app.chat.push(app::ChatEntry::System(format!(
+                                                    "Token usage:\n  Input:  {}\n  Output: {}\n  Total:  {}",
+                                                    app.total_input_tokens, app.total_output_tokens, total
+                                                )));
+                                            } else if trimmed == "/resume" {
+                                                match history::list_sessions() {
+                                                    Ok(sessions) if sessions.is_empty() => {
+                                                        app.chat.push(app::ChatEntry::System("No previous sessions found.".to_string()));
+                                                    }
+                                                    Ok(sessions) => {
+                                                        let mut msg = "Previous sessions:\n".to_string();
+                                                        for (id, modified) in &sessions {
+                                                            msg.push_str(&format!("  asobi --restore {id}  ({modified})\n"));
+                                                        }
+                                                        app.chat.push(app::ChatEntry::System(msg));
+                                                    }
+                                                    Err(e) => {
+                                                        app.chat.push(app::ChatEntry::Error(format!("{e:#}")));
+                                                    }
+                                                }
+                                            } else if trimmed.starts_with('/') {
+                                                app.chat.push(app::ChatEntry::Error(format!(
+                                                    "Unknown command: {trimmed}. Available: /tools, /usage, /resume, /quit"
+                                                )));
+                                            } else if !trimmed.is_empty() {
                                                 app.chat.push(app::ChatEntry::User(input.clone()));
                                                 app.is_streaming = true;
                                                 let _ = user_tx.send(input);
