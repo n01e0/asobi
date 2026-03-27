@@ -21,6 +21,11 @@ fn sessions_dir() -> PathBuf {
     std::env::var("ASOBI_HISTORY_DIR")
         .ok()
         .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("XDG_CONFIG_HOME")
+                .ok()
+                .map(|xdg| PathBuf::from(xdg).join("asobi"))
+        })
         .or_else(|| home::home_dir().map(|h| h.join(".asobi")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("sessions")

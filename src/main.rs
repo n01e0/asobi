@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod config;
 mod history;
 mod tools;
 
@@ -18,9 +19,13 @@ const DEFAULT_MODEL_ID: &str = "openai.gpt-oss-120b-1:0";
 #[derive(Parser)]
 #[command(name = "asobi", version, about = "A minimal coding agent powered by AWS Bedrock")]
 struct Cli {
-    /// Bedrock model ID to use
-    #[arg(short, long, env = "ASOBI_MODEL", default_value = DEFAULT_MODEL_ID)]
-    model: String,
+    /// Bedrock model ID or ARN to use
+    #[arg(short, long, env = "ASOBI_MODEL")]
+    model: Option<String>,
+
+    /// AWS region for ARN resolution
+    #[arg(long, env = "AWS_REGION")]
+    region: Option<String>,
 
     /// System prompt to use
     #[arg(long, env = "ASOBI_SYSTEM_PROMPT")]
@@ -41,6 +46,29 @@ struct Cli {
     /// Restore a specific session by ID
     #[arg(long)]
     restore: Option<String>,
+}
+
+struct ResolvedConfig {
+    model: String,
+    region: Option<String>,
+    system_prompt: Option<String>,
+}
+
+impl ResolvedConfig {
+    fn from_cli_and_config(cli: &Cli, cfg: &config::Config) -> Self {
+        Self {
+            model: cli
+                .model
+                .clone()
+                .or_else(|| cfg.model.clone())
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+            region: cli.region.clone().or_else(|| cfg.region.clone()),
+            system_prompt: cli
+                .system_prompt
+                .clone()
+                .or_else(|| cfg.system_prompt.clone()),
+        }
+    }
 }
 
 impl Cli {
@@ -77,15 +105,17 @@ impl Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let cfg = config::load();
+    let resolved = ResolvedConfig::from_cli_and_config(&cli, &cfg);
     let prompt = cli.resolve_prompt()?;
     let (session_id, restore) = cli.resolve_session()?;
 
     if let Some(prompt) = prompt {
-        run_non_interactive(cli, &prompt, session_id, restore).await
+        run_non_interactive(resolved, &prompt, session_id, restore).await
     } else {
         let mut terminal = ratatui::init();
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-        let result = run_interactive(&mut terminal, cli, &session_id, restore).await;
+        let result = run_interactive(&mut terminal, resolved, &session_id, restore).await;
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
         ratatui::restore();
         eprintln!("\nTo resume this session:\n  asobi --restore {session_id}");
@@ -94,20 +124,21 @@ async fn main() -> Result<()> {
 }
 
 async fn run_non_interactive(
-    cli: Cli,
+    resolved: ResolvedConfig,
     prompt: &str,
     session_id: String,
     restore: bool,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<agent::AgentEvent>();
 
-    let model_id = cli.model;
-    let system_prompt = cli.system_prompt;
+    let model_id = resolved.model;
+    let region = resolved.region;
+    let system_prompt = resolved.system_prompt;
     let prompt = prompt.to_string();
     let sid = session_id.clone();
 
     let agent_handle = tokio::spawn(async move {
-        let mut agent = agent::Agent::new(model_id, system_prompt, sid, restore).await?;
+        let mut agent = agent::Agent::new(model_id, region, system_prompt, sid, restore).await?;
         agent.send(&prompt, tx).await;
         Ok::<_, anyhow::Error>(())
     });
@@ -150,7 +181,7 @@ async fn run_non_interactive(
 
 async fn run_interactive(
     terminal: &mut ratatui::DefaultTerminal,
-    cli: Cli,
+    resolved: ResolvedConfig,
     session_id: &str,
     restore: bool,
 ) -> Result<()> {
@@ -166,11 +197,12 @@ async fn run_interactive(
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<agent::AgentEvent>();
 
-    let model_id = cli.model;
-    let system_prompt = cli.system_prompt;
+    let model_id = resolved.model;
+    let region = resolved.region;
+    let system_prompt = resolved.system_prompt;
     let sid = session_id.to_string();
     tokio::spawn(async move {
-        let mut agent = match agent::Agent::new(model_id, system_prompt, sid, restore).await {
+        let mut agent = match agent::Agent::new(model_id, region, system_prompt, sid, restore).await {
             Ok(a) => a,
             Err(e) => {
                 let _ = agent_tx.send(agent::AgentEvent::Error(format!("{e:#}")));
@@ -271,7 +303,8 @@ mod tests {
 
     fn cli_base() -> Cli {
         Cli {
-            model: DEFAULT_MODEL_ID.to_string(),
+            model: None,
+            region: None,
             system_prompt: None,
             prompt: None,
             prompt_file: None,

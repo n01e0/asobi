@@ -31,12 +31,17 @@ pub struct Agent {
 impl Agent {
     pub async fn new(
         model_id: String,
+        region: Option<String>,
         system_prompt: Option<String>,
         session_id: String,
         restore: bool,
     ) -> Result<Self> {
-        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let client = Client::new(&config);
+        let mut aws_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(ref r) = region {
+            aws_loader = aws_loader.region(aws_config::Region::new(r.clone()));
+        }
+        let aws_config = aws_loader.load().await;
+        let client = Client::new(&aws_config);
 
         let messages = if restore {
             history::load(&session_id).await.unwrap_or_default()
@@ -47,9 +52,8 @@ impl Agent {
         let model_id = if model_id.starts_with("arn:") {
             model_id
         } else {
-            let region = config
-                .region()
-                .map(|r| r.as_ref().to_string())
+            let region = region
+                .or_else(|| aws_config.region().map(|r| r.as_ref().to_string()))
                 .unwrap_or_else(|| "us-east-1".to_string());
             format!("arn:aws:bedrock:{region}::foundation-model/{model_id}")
         };
