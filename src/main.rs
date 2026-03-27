@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod history;
 mod tools;
+mod wasm_tool;
 
 use anyhow::{Context as _, Result};
 use app::App;
@@ -12,6 +13,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use std::io::Write;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 const DEFAULT_MODEL_ID: &str = "openai.gpt-oss-120b-1:0";
@@ -110,12 +112,15 @@ async fn main() -> Result<()> {
     let prompt = cli.resolve_prompt()?;
     let (session_id, restore) = cli.resolve_session()?;
 
+    let base_dir = config::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let registry = Arc::new(tools::ToolRegistry::new(&cfg.tools, &base_dir));
+
     if let Some(prompt) = prompt {
-        run_non_interactive(resolved, &prompt, session_id, restore).await
+        run_non_interactive(resolved, &prompt, session_id, restore, Arc::clone(&registry)).await
     } else {
         let mut terminal = ratatui::init();
         crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
-        let result = run_interactive(&mut terminal, resolved, &session_id, restore).await;
+        let result = run_interactive(&mut terminal, resolved, &session_id, restore, registry).await;
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
         ratatui::restore();
         eprintln!("\nTo resume this session:\n  asobi --restore {session_id}");
@@ -128,6 +133,7 @@ async fn run_non_interactive(
     prompt: &str,
     session_id: String,
     restore: bool,
+    registry: Arc<tools::ToolRegistry>,
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<agent::AgentEvent>();
 
@@ -138,7 +144,7 @@ async fn run_non_interactive(
     let sid = session_id.clone();
 
     let agent_handle = tokio::spawn(async move {
-        let mut agent = agent::Agent::new(model_id, region, system_prompt, sid, restore).await?;
+        let mut agent = agent::Agent::new(model_id, region, system_prompt, sid, restore, registry).await?;
         agent.send(&prompt, tx).await;
         Ok::<_, anyhow::Error>(())
     });
@@ -184,6 +190,7 @@ async fn run_interactive(
     resolved: ResolvedConfig,
     session_id: &str,
     restore: bool,
+    registry: Arc<tools::ToolRegistry>,
 ) -> Result<()> {
     let mut app = App::new();
     let mut event_stream = EventStream::new();
@@ -202,7 +209,7 @@ async fn run_interactive(
     let system_prompt = resolved.system_prompt;
     let sid = session_id.to_string();
     tokio::spawn(async move {
-        let mut agent = match agent::Agent::new(model_id, region, system_prompt, sid, restore).await {
+        let mut agent = match agent::Agent::new(model_id, region, system_prompt, sid, restore, registry).await {
             Ok(a) => a,
             Err(e) => {
                 let _ = agent_tx.send(agent::AgentEvent::Error(format!("{e:#}")));

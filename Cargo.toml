@@ -20,3 +20,5 @@ tokio = { version = "1.50.0", features = ["full"] }
 toml = "1.1.0"
 unicode-width = "0.2.2"
 uuid = { version = "1.23.0", features = ["v4"] }
+wasmtime = { version = "43.0.0", features = ["cranelift"] }
+wasmtime-wasi = "43.0.0"

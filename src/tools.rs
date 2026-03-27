@@ -5,8 +5,106 @@ use aws_sdk_bedrockruntime::types::{
 use aws_smithy_types::Document;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
-pub fn tool_definitions() -> Vec<Tool> {
+use crate::config::WasmToolConfig;
+use crate::wasm_tool::WasmTool;
+
+pub struct ToolRegistry {
+    wasm_tools: HashMap<String, Arc<WasmTool>>,
+}
+
+impl ToolRegistry {
+    pub fn new(wasm_configs: &[WasmToolConfig], base_dir: &Path) -> Self {
+        let mut wasm_tools = HashMap::new();
+        for cfg in wasm_configs {
+            match WasmTool::load(cfg, base_dir) {
+                Ok(tool) => {
+                    eprintln!("[plugin] loaded: {}", tool.name);
+                    wasm_tools.insert(tool.name.clone(), Arc::new(tool));
+                }
+                Err(e) => {
+                    eprintln!("[plugin] failed to load {}: {e:#}", cfg.name);
+                }
+            }
+        }
+        Self { wasm_tools }
+    }
+
+    pub fn tool_definitions(&self) -> Vec<Tool> {
+        let mut defs = builtin_definitions();
+        for tool in self.wasm_tools.values() {
+            let schema_doc = json_value_to_document(&tool.schema);
+            if let Ok(spec) = ToolSpecification::builder()
+                .name(&tool.name)
+                .description(&tool.description)
+                .input_schema(ToolInputSchema::Json(schema_doc))
+                .build()
+            {
+                defs.push(Tool::ToolSpec(spec));
+            }
+        }
+        defs
+    }
+
+    pub async fn execute_tool(
+        &self,
+        name: &str,
+        tool_use_id: &str,
+        input: &Document,
+    ) -> ToolResultBlock {
+        let result = match name {
+            "read_file" => exec_read_file(input).await,
+            "write_file" => exec_write_file(input).await,
+            "run_command" => exec_run_command(input).await,
+            "list_files" => exec_list_files(input).await,
+            _ => {
+                if let Some(wasm_tool) = self.wasm_tools.get(name) {
+                    let input_json = document_to_json_string(input);
+                    let tool = Arc::clone(wasm_tool);
+                    tokio::task::spawn_blocking(move || tool.execute(&input_json))
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("task join error: {e}")))
+                } else {
+                    Err(anyhow::anyhow!("unknown tool: {name}"))
+                }
+            }
+        };
+
+        build_tool_result(tool_use_id, result)
+    }
+}
+
+fn build_tool_result(tool_use_id: &str, result: Result<String>) -> ToolResultBlock {
+    let (text, status) = match result {
+        Ok(output) => (output, None),
+        Err(e) => (
+            format!("Error: {e:#}"),
+            Some(aws_sdk_bedrockruntime::types::ToolResultStatus::Error),
+        ),
+    };
+
+    let mut builder = ToolResultBlock::builder()
+        .tool_use_id(tool_use_id)
+        .content(ToolResultContentBlock::Text(text.clone()));
+    if let Some(s) = status {
+        builder = builder.status(s);
+    }
+
+    match builder.build() {
+        Ok(block) => block,
+        Err(e) => ToolResultBlock::builder()
+            .tool_use_id(tool_use_id)
+            .content(ToolResultContentBlock::Text(format!(
+                "Internal error building tool result: {e}"
+            )))
+            .status(aws_sdk_bedrockruntime::types::ToolResultStatus::Error)
+            .build()
+            .expect("fallback tool result with all required fields"),
+    }
+}
+
+fn builtin_definitions() -> Vec<Tool> {
     vec![
         read_file_def(),
         write_file_def(),
@@ -21,7 +119,12 @@ fn json_schema(properties: Document, required: Vec<&str>) -> Document {
         ("properties".into(), properties),
         (
             "required".into(),
-            Document::Array(required.into_iter().map(|s| Document::String(s.into())).collect()),
+            Document::Array(
+                required
+                    .into_iter()
+                    .map(|s| Document::String(s.into()))
+                    .collect(),
+            ),
         ),
     ]))
 }
@@ -55,7 +158,10 @@ fn write_file_def() -> Tool {
     let schema = json_schema(
         Document::Object(HashMap::from([
             ("path".into(), string_prop("Path to the file to write")),
-            ("content".into(), string_prop("Content to write to the file")),
+            (
+                "content".into(),
+                string_prop("Content to write to the file"),
+            ),
         ])),
         vec!["path", "content"],
     );
@@ -115,47 +221,6 @@ fn get_string_param<'a>(input: &'a Document, key: &str) -> Result<&'a str> {
     }
 }
 
-pub async fn execute_tool(name: &str, tool_use_id: &str, input: &Document) -> ToolResultBlock {
-    let result = match name {
-        "read_file" => exec_read_file(input).await,
-        "write_file" => exec_write_file(input).await,
-        "run_command" => exec_run_command(input).await,
-        "list_files" => exec_list_files(input).await,
-        _ => Err(anyhow::anyhow!("unknown tool: {name}")),
-    };
-
-    let (text, status) = match result {
-        Ok(output) => (output, None),
-        Err(e) => (
-            format!("Error: {e:#}"),
-            Some(aws_sdk_bedrockruntime::types::ToolResultStatus::Error),
-        ),
-    };
-
-    let mut builder = ToolResultBlock::builder()
-        .tool_use_id(tool_use_id)
-        .content(ToolResultContentBlock::Text(text.clone()));
-    if let Some(s) = status {
-        builder = builder.status(s);
-    }
-
-    match builder.build() {
-        Ok(block) => block,
-        Err(e) => {
-            // tool_use_id + content が揃っている以上ここには到達しないが、
-            // 万一の場合はエラー内容をテキストとして返す
-            ToolResultBlock::builder()
-                .tool_use_id(tool_use_id)
-                .content(ToolResultContentBlock::Text(format!(
-                    "Internal error building tool result: {e}"
-                )))
-                .status(aws_sdk_bedrockruntime::types::ToolResultStatus::Error)
-                .build()
-                .expect("fallback tool result with all required fields")
-        }
-    }
-}
-
 async fn exec_read_file(input: &Document) -> Result<String> {
     let path = get_string_param(input, "path")?;
     tokio::fs::read_to_string(path)
@@ -208,6 +273,61 @@ async fn exec_list_files(input: &Document) -> Result<String> {
     Ok(names.join("\n"))
 }
 
+fn json_value_to_document(value: &serde_json::Value) -> Document {
+    match value {
+        serde_json::Value::Null => Document::Null,
+        serde_json::Value::Bool(b) => Document::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Document::Number(aws_smithy_types::Number::NegInt(i))
+            } else if let Some(f) = n.as_f64() {
+                Document::Number(aws_smithy_types::Number::Float(f))
+            } else {
+                Document::Null
+            }
+        }
+        serde_json::Value::String(s) => Document::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            Document::Array(arr.iter().map(json_value_to_document).collect())
+        }
+        serde_json::Value::Object(obj) => Document::Object(
+            obj.iter()
+                .map(|(k, v)| (k.clone(), json_value_to_document(v)))
+                .collect(),
+        ),
+    }
+}
+
+fn document_to_json_string(doc: &Document) -> String {
+    let value = document_to_json_value(doc);
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn document_to_json_value(doc: &Document) -> serde_json::Value {
+    match doc {
+        Document::Null => serde_json::Value::Null,
+        Document::Bool(b) => serde_json::Value::Bool(*b),
+        Document::Number(n) => match n {
+            aws_smithy_types::Number::PosInt(i) => serde_json::json!(*i),
+            aws_smithy_types::Number::NegInt(i) => serde_json::json!(*i),
+            aws_smithy_types::Number::Float(f) => serde_json::Value::Number(
+                serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
+        },
+        Document::String(s) => serde_json::Value::String(s.clone()),
+        Document::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(document_to_json_value).collect())
+        }
+        Document::Object(obj) => {
+            let map: serde_json::Map<String, serde_json::Value> = obj
+                .iter()
+                .map(|(k, v)| (k.clone(), document_to_json_value(v)))
+                .collect();
+            serde_json::Value::Object(map)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,8 +342,8 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_definitions_count() {
-        assert_eq!(tool_definitions().len(), 4);
+    fn test_builtin_definitions_count() {
+        assert_eq!(builtin_definitions().len(), 4);
     }
 
     #[test]
@@ -295,12 +415,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_unknown_tool() {
+    async fn test_registry_execute_unknown() {
+        let registry = ToolRegistry::new(&[], Path::new("."));
         let input = Document::Object(HashMap::new());
-        let result = execute_tool("nonexistent", "id-1", &input).await;
+        let result = registry.execute_tool("nonexistent", "id-1", &input).await;
         assert_eq!(
             result.status(),
             Some(&aws_sdk_bedrockruntime::types::ToolResultStatus::Error)
         );
+    }
+
+    #[test]
+    fn test_registry_definitions_include_builtins() {
+        let registry = ToolRegistry::new(&[], Path::new("."));
+        let defs = registry.tool_definitions();
+        assert!(defs.len() >= 4);
     }
 }

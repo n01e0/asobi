@@ -7,7 +7,10 @@ use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::Document;
 use tokio::sync::mpsc;
 
-use crate::{history, tools};
+use std::sync::Arc;
+
+use crate::history;
+use crate::tools::ToolRegistry;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant. You have access to tools for reading files, writing files, running shell commands, and listing directory contents. Use these tools to help the user with their coding tasks.";
 
@@ -26,6 +29,7 @@ pub struct Agent {
     system_prompt: String,
     session_id: String,
     messages: Vec<Message>,
+    registry: Arc<ToolRegistry>,
 }
 
 impl Agent {
@@ -35,6 +39,7 @@ impl Agent {
         system_prompt: Option<String>,
         session_id: String,
         restore: bool,
+        registry: Arc<ToolRegistry>,
     ) -> Result<Self> {
         let mut aws_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(ref r) = region {
@@ -64,6 +69,7 @@ impl Agent {
             system_prompt: system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             session_id,
             messages,
+            registry,
         })
     }
 
@@ -129,7 +135,7 @@ impl Agent {
                     input: input_str,
                 });
 
-                let result = tools::execute_tool(name, tool_use_id, input).await;
+                let result = self.registry.execute_tool(name, tool_use_id, input).await;
                 let output = result
                     .content()
                     .first()
@@ -161,7 +167,7 @@ impl Agent {
         tx: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(String, Vec<ToolUseBlock>)> {
         let tool_config = ToolConfiguration::builder()
-            .set_tools(Some(tools::tool_definitions()))
+            .set_tools(Some(self.registry.tool_definitions()))
             .build()
             .context("failed to build tool configuration")?;
 

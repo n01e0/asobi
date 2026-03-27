@@ -8,6 +8,8 @@ pub struct Config {
     pub system_prompt: Option<String>,
     #[allow(dead_code)]
     pub provider: Option<ProviderConfig>,
+    #[serde(default)]
+    pub tools: Vec<WasmToolConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -16,7 +18,26 @@ pub struct ProviderConfig {
     pub name: Option<String>,
 }
 
-fn config_dir() -> Option<PathBuf> {
+#[derive(Debug, Clone, Deserialize)]
+pub struct WasmToolConfig {
+    pub name: String,
+    pub wasm: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub permissions: WasmPermissions,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WasmPermissions {
+    #[serde(default)]
+    pub fs_read: Vec<String>,
+    #[serde(default)]
+    pub fs_write: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+pub fn config_dir() -> Option<PathBuf> {
     std::env::var("XDG_CONFIG_HOME")
         .ok()
         .map(|xdg| PathBuf::from(xdg).join("asobi"))
@@ -63,14 +84,38 @@ model = "openai.gpt-oss-120b-1:0"
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.model.as_deref(), Some("openai.gpt-oss-120b-1:0"));
         assert!(config.region.is_none());
-        assert!(config.system_prompt.is_none());
-        assert!(config.provider.is_none());
+        assert!(config.tools.is_empty());
     }
 
     #[test]
     fn test_parse_empty_config() {
         let config: Config = toml::from_str("").unwrap();
         assert!(config.model.is_none());
+    }
+
+    #[test]
+    fn test_parse_wasm_tools() {
+        let toml = r#"
+[[tools]]
+name = "search_code"
+wasm = "plugins/search_code.wasm"
+description = "Search code using ripgrep"
+
+[tools.permissions]
+fs_read = ["."]
+env = ["PATH"]
+
+[[tools]]
+name = "fetch_url"
+wasm = "plugins/fetch_url.wasm"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.tools.len(), 2);
+        assert_eq!(config.tools[0].name, "search_code");
+        assert_eq!(config.tools[0].permissions.fs_read, vec!["."]);
+        assert_eq!(config.tools[0].permissions.env, vec!["PATH"]);
+        assert_eq!(config.tools[1].name, "fetch_url");
+        assert!(config.tools[1].permissions.fs_read.is_empty());
     }
 
     #[test]
