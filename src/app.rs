@@ -23,9 +23,9 @@ pub struct App {
     pub streaming_text: String,
     pub is_streaming: bool,
     pub scroll_offset: u16,
-    pub should_quit: bool,
     pub content_height: u16,
     pub viewport_height: u16,
+    quit_pending: bool,
 }
 
 impl App {
@@ -37,10 +37,22 @@ impl App {
             streaming_text: String::new(),
             is_streaming: false,
             scroll_offset: 0,
-            should_quit: false,
             content_height: 0,
             viewport_height: 0,
+            quit_pending: false,
         }
+    }
+
+    pub fn request_quit(&mut self) -> bool {
+        if self.quit_pending {
+            return true;
+        }
+        self.quit_pending = true;
+        false
+    }
+
+    pub fn reset_quit_pending(&mut self) {
+        self.quit_pending = false;
     }
 
     pub fn handle_agent_event(&mut self, event: AgentEvent) {
@@ -97,6 +109,11 @@ impl App {
     pub fn take_input(&mut self) -> String {
         self.cursor_pos = 0;
         std::mem::take(&mut self.input)
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor_pos = 0;
     }
 
     pub fn scroll_up(&mut self) {
@@ -235,10 +252,17 @@ pub fn render(app: &mut App, frame: &mut Frame) {
         .scroll((app.scroll_offset, 0));
     frame.render_widget(chat_widget, chat_area);
 
+    let input_title = if app.quit_pending {
+        " Press Ctrl+C/Ctrl+D again to quit "
+    } else if app.is_streaming {
+        " waiting... "
+    } else {
+        " > "
+    };
     let input_widget = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(if app.is_streaming { " waiting... " } else { " > " }),
+            .title(input_title),
     );
     frame.render_widget(input_widget, input_area);
 
@@ -381,5 +405,34 @@ mod tests {
     fn test_truncate_newlines() {
         let result = truncate("line1\nline2\nline3", 100);
         assert_eq!(result, "line1 line2 line3");
+    }
+
+    #[test]
+    fn test_request_quit_double_press() {
+        let mut app = App::new();
+        assert!(!app.request_quit());
+        assert!(app.quit_pending);
+        assert!(app.request_quit());
+    }
+
+    #[test]
+    fn test_reset_quit_pending() {
+        let mut app = App::new();
+        app.request_quit();
+        assert!(app.quit_pending);
+        app.reset_quit_pending();
+        assert!(!app.quit_pending);
+        assert!(!app.request_quit());
+    }
+
+    #[test]
+    fn test_clear_input() {
+        let mut app = App::new();
+        app.insert_char('a');
+        app.insert_char('b');
+        app.insert_char('c');
+        app.clear_input();
+        assert_eq!(app.input, "");
+        assert_eq!(app.cursor_pos, 0);
     }
 }

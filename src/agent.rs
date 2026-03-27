@@ -24,14 +24,25 @@ pub struct Agent {
     client: Client,
     model_id: String,
     system_prompt: String,
+    session_id: String,
     messages: Vec<Message>,
 }
 
 impl Agent {
-    pub async fn new(model_id: String, system_prompt: Option<String>) -> Result<Self> {
+    pub async fn new(
+        model_id: String,
+        system_prompt: Option<String>,
+        session_id: String,
+        restore: bool,
+    ) -> Result<Self> {
         let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = Client::new(&config);
-        let messages = history::load().await.unwrap_or_default();
+
+        let messages = if restore {
+            history::load(&session_id).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let model_id = if model_id.starts_with("arn:") {
             model_id
@@ -47,6 +58,7 @@ impl Agent {
             client,
             model_id,
             system_prompt: system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
+            session_id,
             messages,
         })
     }
@@ -62,7 +74,7 @@ impl Agent {
         if let Err(e) = self.run_loop(tx.clone()).await {
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
         }
-        let _ = history::append(&self.messages).await;
+        let _ = history::save(&self.session_id, &self.messages).await;
         let _ = tx.send(AgentEvent::TurnEnd);
     }
 

@@ -31,6 +31,14 @@ struct Cli {
     /// Run non-interactively with the prompt read from a file ("-" for stdin)
     #[arg(short = 'f', long)]
     prompt_file: Option<String>,
+
+    /// Continue the most recent session
+    #[arg(short = 'c', long)]
+    r#continue: bool,
+
+    /// Restore a specific session by ID
+    #[arg(long)]
+    restore: Option<String>,
 }
 
 impl Cli {
@@ -50,32 +58,52 @@ impl Cli {
         }
         Ok(None)
     }
+
+    fn resolve_session(&self) -> Result<(String, bool)> {
+        if let Some(ref id) = self.restore {
+            return Ok((id.clone(), true));
+        }
+        if self.r#continue {
+            let id = history::latest_session_id()?
+                .context("no previous session found")?;
+            return Ok((id, true));
+        }
+        Ok((history::new_session_id(), false))
+    }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let prompt = cli.resolve_prompt()?;
+    let (session_id, restore) = cli.resolve_session()?;
 
     if let Some(prompt) = prompt {
-        run_non_interactive(cli, &prompt).await
+        run_non_interactive(cli, &prompt, session_id, restore).await
     } else {
         let mut terminal = ratatui::init();
-        let result = run_interactive(&mut terminal, cli).await;
+        let result = run_interactive(&mut terminal, cli, &session_id, restore).await;
         ratatui::restore();
+        eprintln!("\nTo resume this session:\n  asobi --restore {session_id}");
         result
     }
 }
 
-async fn run_non_interactive(cli: Cli, prompt: &str) -> Result<()> {
+async fn run_non_interactive(
+    cli: Cli,
+    prompt: &str,
+    session_id: String,
+    restore: bool,
+) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<agent::AgentEvent>();
 
     let model_id = cli.model;
     let system_prompt = cli.system_prompt;
     let prompt = prompt.to_string();
+    let sid = session_id.clone();
 
     let agent_handle = tokio::spawn(async move {
-        let mut agent = agent::Agent::new(model_id, system_prompt).await?;
+        let mut agent = agent::Agent::new(model_id, system_prompt, sid, restore).await?;
         agent.send(&prompt, tx).await;
         Ok::<_, anyhow::Error>(())
     });
@@ -108,13 +136,20 @@ async fn run_non_interactive(cli: Cli, prompt: &str) -> Result<()> {
 
     agent_handle.await??;
 
+    eprintln!("\nTo resume this session:\n  asobi --restore {session_id}");
+
     if has_error {
         std::process::exit(1);
     }
     Ok(())
 }
 
-async fn run_interactive(terminal: &mut ratatui::DefaultTerminal, cli: Cli) -> Result<()> {
+async fn run_interactive(
+    terminal: &mut ratatui::DefaultTerminal,
+    cli: Cli,
+    session_id: &str,
+    restore: bool,
+) -> Result<()> {
     let mut app = App::new();
     let mut event_stream = EventStream::new();
 
@@ -123,8 +158,9 @@ async fn run_interactive(terminal: &mut ratatui::DefaultTerminal, cli: Cli) -> R
 
     let model_id = cli.model;
     let system_prompt = cli.system_prompt;
+    let sid = session_id.to_string();
     tokio::spawn(async move {
-        let mut agent = match agent::Agent::new(model_id, system_prompt).await {
+        let mut agent = match agent::Agent::new(model_id, system_prompt, sid, restore).await {
             Ok(a) => a,
             Err(e) => {
                 let _ = agent_tx.send(agent::AgentEvent::Error(format!("{e:#}")));
@@ -144,28 +180,42 @@ async fn run_interactive(terminal: &mut ratatui::DefaultTerminal, cli: Cli) -> R
             Some(Ok(event)) = event_stream.next() => {
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-                            app.should_quit = true;
-                        } else if app.is_streaming {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                        if ctrl && (key.code == KeyCode::Char('c') || key.code == KeyCode::Char('d')) {
+                            if app.request_quit() {
+                                break;
+                            }
                         } else {
-                            match key.code {
-                                KeyCode::Enter => {
-                                    let input = app.take_input();
-                                    if input.trim() == "/quit" {
-                                        app.should_quit = true;
-                                    } else if !input.trim().is_empty() {
-                                        app.chat.push(app::ChatEntry::User(input.clone()));
-                                        app.is_streaming = true;
-                                        let _ = user_tx.send(input);
-                                    }
+                            app.reset_quit_pending();
+
+                            if app.is_streaming {
+                            } else if ctrl {
+                                match key.code {
+                                    KeyCode::Char('h') => app.delete_char(),
+                                    KeyCode::Char('u') => app.clear_input(),
+                                    _ => {}
                                 }
-                                KeyCode::Char(c) => app.insert_char(c),
-                                KeyCode::Backspace => app.delete_char(),
-                                KeyCode::Left => app.move_cursor_left(),
-                                KeyCode::Right => app.move_cursor_right(),
-                                KeyCode::Up => app.scroll_up(),
-                                KeyCode::Down => app.scroll_down(),
-                                _ => {}
+                            } else {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        let input = app.take_input();
+                                        if input.trim() == "/quit" {
+                                            break;
+                                        } else if !input.trim().is_empty() {
+                                            app.chat.push(app::ChatEntry::User(input.clone()));
+                                            app.is_streaming = true;
+                                            let _ = user_tx.send(input);
+                                        }
+                                    }
+                                    KeyCode::Char(c) => app.insert_char(c),
+                                    KeyCode::Backspace => app.delete_char(),
+                                    KeyCode::Left => app.move_cursor_left(),
+                                    KeyCode::Right => app.move_cursor_right(),
+                                    KeyCode::Up => app.scroll_up(),
+                                    KeyCode::Down => app.scroll_down(),
+                                    _ => {}
+                                }
                             }
                         }
                     }
@@ -176,10 +226,6 @@ async fn run_interactive(terminal: &mut ratatui::DefaultTerminal, cli: Cli) -> R
                 app.handle_agent_event(event);
             }
         }
-
-        if app.should_quit {
-            break;
-        }
     }
     Ok(())
 }
@@ -188,24 +234,27 @@ async fn run_interactive(terminal: &mut ratatui::DefaultTerminal, cli: Cli) -> R
 mod tests {
     use super::*;
 
-    fn cli_with(prompt: Option<&str>, prompt_file: Option<&str>) -> Cli {
+    fn cli_base() -> Cli {
         Cli {
             model: DEFAULT_MODEL_ID.to_string(),
             system_prompt: None,
-            prompt: prompt.map(|s| s.to_string()),
-            prompt_file: prompt_file.map(|s| s.to_string()),
+            prompt: None,
+            prompt_file: None,
+            r#continue: false,
+            restore: None,
         }
     }
 
     #[test]
     fn test_resolve_prompt_none() {
-        let cli = cli_with(None, None);
+        let cli = cli_base();
         assert!(cli.resolve_prompt().unwrap().is_none());
     }
 
     #[test]
     fn test_resolve_prompt_inline() {
-        let cli = cli_with(Some("hello"), None);
+        let mut cli = cli_base();
+        cli.prompt = Some("hello".to_string());
         assert_eq!(cli.resolve_prompt().unwrap().unwrap(), "hello");
     }
 
@@ -216,7 +265,8 @@ mod tests {
         let file = dir.join("prompt.txt");
         std::fs::write(&file, "from file").unwrap();
 
-        let cli = cli_with(None, Some(file.to_str().unwrap()));
+        let mut cli = cli_base();
+        cli.prompt_file = Some(file.to_str().unwrap().to_string());
         assert_eq!(cli.resolve_prompt().unwrap().unwrap(), "from file");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -224,13 +274,33 @@ mod tests {
 
     #[test]
     fn test_resolve_prompt_file_not_found() {
-        let cli = cli_with(None, Some("/nonexistent/path/prompt.txt"));
+        let mut cli = cli_base();
+        cli.prompt_file = Some("/nonexistent/path/prompt.txt".to_string());
         assert!(cli.resolve_prompt().is_err());
     }
 
     #[test]
     fn test_resolve_prompt_inline_takes_precedence() {
-        let cli = cli_with(Some("inline"), Some("/some/file"));
+        let mut cli = cli_base();
+        cli.prompt = Some("inline".to_string());
+        cli.prompt_file = Some("/some/file".to_string());
         assert_eq!(cli.resolve_prompt().unwrap().unwrap(), "inline");
+    }
+
+    #[test]
+    fn test_resolve_session_new() {
+        let cli = cli_base();
+        let (id, restore) = cli.resolve_session().unwrap();
+        assert!(!restore);
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_session_restore() {
+        let mut cli = cli_base();
+        cli.restore = Some("abc-123".to_string());
+        let (id, restore) = cli.resolve_session().unwrap();
+        assert!(restore);
+        assert_eq!(id, "abc-123");
     }
 }

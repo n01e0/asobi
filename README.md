@@ -8,7 +8,8 @@ A minimal coding agent with a TUI interface, powered by AWS Bedrock.
 - Non-interactive mode for CI/CD and scripting
 - Streaming response from AWS Bedrock (Converse Stream API)
 - Tool use: `read_file`, `write_file`, `run_command`, `list_files`
-- Conversation history persisted as JSONL (`~/.asobi/history.jsonl`)
+- Session-based conversation history (`~/.asobi/sessions/<ID>.jsonl`)
+- Session restore with `--restore <ID>` or `-c` (continue last)
 - Configurable model via CLI args or environment variables
 - Model ID is automatically resolved to a region-specific ARN from `AWS_REGION`
 
@@ -30,6 +31,23 @@ cargo install --path .
 
 ```sh
 asobi
+```
+
+Each session gets a unique ID. On exit, a restore hint is printed:
+
+```
+To resume this session:
+  asobi --restore 9f3a1b2c-...
+```
+
+### Session Management
+
+```sh
+# Continue the most recent session
+asobi -c
+
+# Restore a specific session by ID
+asobi --restore 9f3a1b2c-4d5e-6f7a-8b9c-0d1e2f3a4b5c
 ```
 
 ### Non-interactive Mode
@@ -71,6 +89,8 @@ In non-interactive mode:
     --system-prompt <PROMPT>       System prompt [env: ASOBI_SYSTEM_PROMPT]
 -p, --prompt <PROMPT>              Run non-interactively with the given prompt
 -f, --prompt-file <PATH>           Run non-interactively with prompt from file ("-" for stdin)
+-c, --continue                     Continue the most recent session
+    --restore <SESSION_ID>         Restore a specific session by ID
 -h, --help                         Print help
 -V, --version                      Print version
 ```
@@ -101,7 +121,10 @@ asobi --system-prompt "You are a Rust expert. Always prefer idiomatic Rust."
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
-| `Ctrl+C` | Quit |
+| `Ctrl+C` (x2) | Quit |
+| `Ctrl+D` (x2) | Quit |
+| `Ctrl+H` | Delete character (same as Backspace) |
+| `Ctrl+U` | Clear input line |
 | `Up/Down` | Scroll chat history |
 | `Left/Right` | Move cursor in input |
 | `Backspace` | Delete character |
@@ -114,7 +137,7 @@ Type `/quit` and press Enter to exit.
 |---------------------|-------------|
 | `ASOBI_MODEL` | Bedrock model ID or ARN |
 | `ASOBI_SYSTEM_PROMPT` | System prompt |
-| `ASOBI_HISTORY_DIR` | Directory for history file (default: `~/.asobi`) |
+| `ASOBI_HISTORY_DIR` | Directory for session files (default: `~/.asobi`) |
 | `AWS_REGION` | AWS region (used for ARN resolution) |
 | `AWS_PROFILE` | AWS profile name |
 
@@ -125,7 +148,7 @@ main.rs    -- Entry point, TUI event loop, clap CLI, non-interactive mode
 agent.rs   -- Bedrock Converse Stream API, tool execution loop, ARN resolution
 tools.rs   -- Tool definitions (JSON Schema) and execution
 app.rs     -- TUI state management and rendering
-history.rs -- JSONL conversation persistence
+history.rs -- Session-based JSONL conversation persistence
 ```
 
 ## License

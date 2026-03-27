@@ -17,24 +17,54 @@ enum ContentEntry {
     Text { text: String },
 }
 
-fn history_path() -> PathBuf {
-    let dir = dirs_next().unwrap_or_else(|| PathBuf::from("."));
-    dir.join("history.jsonl")
-}
-
-fn dirs_next() -> Option<PathBuf> {
+fn sessions_dir() -> PathBuf {
     std::env::var("ASOBI_HISTORY_DIR")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| {
-            home::home_dir().map(|h| h.join(".asobi"))
-        })
+        .or_else(|| home::home_dir().map(|h| h.join(".asobi")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("sessions")
 }
 
-pub async fn load() -> Result<Vec<Message>> {
-    let path = history_path();
+fn session_path(session_id: &str) -> PathBuf {
+    sessions_dir().join(format!("{session_id}.jsonl"))
+}
+
+pub fn new_session_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+pub fn latest_session_id() -> Result<Option<String>> {
+    let dir = sessions_dir();
+    if !dir.exists() {
+        return Ok(None);
+    }
+
+    let mut newest: Option<(std::time::SystemTime, String)> = None;
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl")
+            && let Ok(meta) = entry.metadata()
+        {
+            let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let id = path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if newest.as_ref().is_none_or(|(t, _)| mtime > *t) {
+                newest = Some((mtime, id));
+            }
+        }
+    }
+    Ok(newest.map(|(_, id)| id))
+}
+
+pub async fn load(session_id: &str) -> Result<Vec<Message>> {
+    let path = session_path(session_id);
     if !path.exists() {
-        return Ok(Vec::new());
+        anyhow::bail!("session not found: {session_id}");
     }
 
     let file = tokio::fs::File::open(&path)
@@ -57,8 +87,8 @@ pub async fn load() -> Result<Vec<Message>> {
     Ok(messages)
 }
 
-pub async fn append(messages: &[Message]) -> Result<()> {
-    let path = history_path();
+pub async fn save(session_id: &str, messages: &[Message]) -> Result<()> {
+    let path = session_path(session_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -71,12 +101,7 @@ pub async fn append(messages: &[Message]) -> Result<()> {
         }
     }
 
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .await?
-        .write_all(content.as_bytes())
+    tokio::fs::write(&path, content.as_bytes())
         .await
         .with_context(|| format!("failed to write to {}", path.display()))?;
 
@@ -94,9 +119,7 @@ fn message_to_entry(msg: &Message) -> Option<HistoryEntry> {
         .content()
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::Text(text) => Some(ContentEntry::Text {
-                text: text.clone(),
-            }),
+            ContentBlock::Text(text) => Some(ContentEntry::Text { text: text.clone() }),
             _ => None,
         })
         .collect();
@@ -129,11 +152,15 @@ fn entry_to_message(entry: &HistoryEntry) -> Option<Message> {
     Some(builder.build().unwrap())
 }
 
-use tokio::io::AsyncWriteExt;
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_new_session_id_is_uuid() {
+        let id = new_session_id();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+    }
 
     #[test]
     fn test_message_to_entry_user() {
@@ -197,11 +224,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_and_load() {
-        let dir = std::env::temp_dir().join("asobi_test_history");
+    async fn test_save_load_and_nonexistent() {
+        let dir = std::env::temp_dir().join("asobi_test_sessions_all");
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::set_var("ASOBI_HISTORY_DIR", &dir) };
 
+        let result = load("nonexistent-id").await;
+        assert!(result.is_err());
+
+        let session_id = new_session_id();
         let messages = vec![
             Message::builder()
                 .role(ConversationRole::User)
@@ -215,11 +246,14 @@ mod tests {
                 .unwrap(),
         ];
 
-        append(&messages).await.unwrap();
-        let loaded = load().await.unwrap();
+        save(&session_id, &messages).await.unwrap();
+        let loaded = load(&session_id).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(*loaded[0].role(), ConversationRole::User);
         assert_eq!(*loaded[1].role(), ConversationRole::Assistant);
+
+        let latest = latest_session_id().unwrap();
+        assert_eq!(latest, Some(session_id));
 
         let _ = std::fs::remove_dir_all(&dir);
         unsafe { std::env::remove_var("ASOBI_HISTORY_DIR") };
