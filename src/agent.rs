@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use std::sync::Arc;
 
-use crate::history;
+use crate::history::{self, SessionUsage};
 use crate::tools::ToolRegistry;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a coding assistant. You have access to tools for reading files, writing files, running shell commands, and listing directory contents. Use these tools to help the user with their coding tasks.";
@@ -30,6 +30,7 @@ pub struct Agent {
     system_prompt: String,
     session_id: String,
     messages: Vec<Message>,
+    usage: SessionUsage,
     registry: Arc<ToolRegistry>,
 }
 
@@ -49,10 +50,12 @@ impl Agent {
         let aws_config = aws_loader.load().await;
         let client = Client::new(&aws_config);
 
-        let messages = if restore {
-            history::load(&session_id).await.unwrap_or_default()
+        let (messages, usage) = if restore {
+            history::load(&session_id)
+                .await
+                .unwrap_or_else(|_| (Vec::new(), SessionUsage::default()))
         } else {
-            Vec::new()
+            (Vec::new(), SessionUsage::default())
         };
 
         let model_id = if model_id.starts_with("arn:") {
@@ -70,6 +73,7 @@ impl Agent {
             system_prompt: system_prompt.unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string()),
             session_id,
             messages,
+            usage,
             registry,
         })
     }
@@ -94,7 +98,7 @@ impl Agent {
             self.messages.pop();
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
         }
-        let _ = history::save(&self.session_id, &self.messages).await;
+        let _ = history::save(&self.session_id, &self.messages, &self.usage).await;
         let _ = tx.send(AgentEvent::TurnEnd);
     }
 
@@ -164,7 +168,7 @@ impl Agent {
     }
 
     async fn call_stream(
-        &self,
+        &mut self,
         tx: &mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<(String, Vec<ToolUseBlock>)> {
         let tool_config = ToolConfiguration::builder()
@@ -241,10 +245,12 @@ impl Agent {
                         }
                         ConverseStreamOutput::MessageStop(_) => break,
                         ConverseStreamOutput::Metadata(meta) => {
-                            if let Some(usage) = meta.usage() {
+                            if let Some(u) = meta.usage() {
+                                self.usage.input_tokens += u.input_tokens() as i64;
+                                self.usage.output_tokens += u.output_tokens() as i64;
                                 let _ = tx.send(AgentEvent::Usage {
-                                    input_tokens: usage.input_tokens(),
-                                    output_tokens: usage.output_tokens(),
+                                    input_tokens: u.input_tokens(),
+                                    output_tokens: u.output_tokens(),
                                 });
                             }
                         }

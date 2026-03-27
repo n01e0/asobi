@@ -258,7 +258,8 @@ async fn exec_run_command(input: &Document) -> Result<String> {
 }
 
 async fn exec_list_files(input: &Document) -> Result<String> {
-    let path = get_string_param(input, "path")?;
+    let raw_path = get_string_param(input, "path")?;
+    let path = if raw_path.is_empty() { "." } else { raw_path };
     let mut entries = tokio::fs::read_dir(path)
         .await
         .with_context(|| format!("failed to read directory {path}"))?;

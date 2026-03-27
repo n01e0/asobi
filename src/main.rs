@@ -199,9 +199,11 @@ async fn run_interactive(
     let mut event_stream = EventStream::new();
 
     if restore
-        && let Ok(messages) = history::load(session_id).await
+        && let Ok((messages, usage)) = history::load(session_id).await
     {
         app.load_history(&messages);
+        app.total_input_tokens = usage.input_tokens;
+        app.total_output_tokens = usage.output_tokens;
     }
 
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();

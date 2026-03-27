@@ -7,7 +7,12 @@ use tokio::io::AsyncBufReadExt;
 #[derive(Serialize, Deserialize)]
 struct HistoryEntry {
     role: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     content: Vec<ContentEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -15,6 +20,12 @@ struct HistoryEntry {
 enum ContentEntry {
     #[serde(rename = "text")]
     Text { text: String },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionUsage {
+    pub input_tokens: i64,
+    pub output_tokens: i64,
 }
 
 fn sessions_dir() -> PathBuf {
@@ -110,7 +121,7 @@ fn format_epoch(secs: u64) -> String {
     format!("{y:04}-{month:02}-{day:02} {h:02}:{m:02}:{s:02} UTC")
 }
 
-pub async fn load(session_id: &str) -> Result<Vec<Message>> {
+pub async fn load(session_id: &str) -> Result<(Vec<Message>, SessionUsage)> {
     let path = session_path(session_id);
     if !path.exists() {
         anyhow::bail!("session not found: {session_id}");
@@ -122,21 +133,25 @@ pub async fn load(session_id: &str) -> Result<Vec<Message>> {
     let reader = tokio::io::BufReader::new(file);
     let mut lines = reader.lines();
     let mut messages = Vec::new();
+    let mut usage = SessionUsage::default();
 
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line)
-            && let Some(msg) = entry_to_message(&entry)
-        {
-            messages.push(msg);
+        if let Ok(entry) = serde_json::from_str::<HistoryEntry>(&line) {
+            if entry.role == "meta" {
+                usage.input_tokens = entry.input_tokens.unwrap_or(0);
+                usage.output_tokens = entry.output_tokens.unwrap_or(0);
+            } else if let Some(msg) = entry_to_message(&entry) {
+                messages.push(msg);
+            }
         }
     }
-    Ok(messages)
+    Ok((messages, usage))
 }
 
-pub async fn save(session_id: &str, messages: &[Message]) -> Result<()> {
+pub async fn save(session_id: &str, messages: &[Message], usage: &SessionUsage) -> Result<()> {
     let path = session_path(session_id);
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -149,6 +164,15 @@ pub async fn save(session_id: &str, messages: &[Message]) -> Result<()> {
             content.push('\n');
         }
     }
+
+    let meta = HistoryEntry {
+        role: "meta".to_string(),
+        content: Vec::new(),
+        input_tokens: Some(usage.input_tokens),
+        output_tokens: Some(usage.output_tokens),
+    };
+    content.push_str(&serde_json::to_string(&meta)?);
+    content.push('\n');
 
     tokio::fs::write(&path, content.as_bytes())
         .await
@@ -180,6 +204,8 @@ fn message_to_entry(msg: &Message) -> Option<HistoryEntry> {
     Some(HistoryEntry {
         role: role.to_string(),
         content,
+        input_tokens: None,
+        output_tokens: None,
     })
 }
 
@@ -254,6 +280,8 @@ mod tests {
             content: vec![ContentEntry::Text {
                 text: "hello world".to_string(),
             }],
+            input_tokens: None,
+            output_tokens: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let deserialized: HistoryEntry = serde_json::from_str(&json).unwrap();
@@ -268,6 +296,8 @@ mod tests {
             content: vec![ContentEntry::Text {
                 text: "x".to_string(),
             }],
+            input_tokens: None,
+            output_tokens: None,
         };
         assert!(entry_to_message(&entry).is_none());
     }
@@ -295,11 +325,14 @@ mod tests {
                 .unwrap(),
         ];
 
-        save(&session_id, &messages).await.unwrap();
-        let loaded = load(&session_id).await.unwrap();
+        let usage = SessionUsage { input_tokens: 100, output_tokens: 50 };
+        save(&session_id, &messages, &usage).await.unwrap();
+        let (loaded, loaded_usage) = load(&session_id).await.unwrap();
         assert_eq!(loaded.len(), 2);
         assert_eq!(*loaded[0].role(), ConversationRole::User);
         assert_eq!(*loaded[1].role(), ConversationRole::Assistant);
+        assert_eq!(loaded_usage.input_tokens, 100);
+        assert_eq!(loaded_usage.output_tokens, 50);
 
         let latest = latest_session_id().unwrap();
         assert_eq!(latest, Some(session_id));
