@@ -6,7 +6,9 @@ mod tools;
 use anyhow::{Context as _, Result};
 use app::App;
 use clap::Parser;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures::StreamExt;
 use std::io::Write;
 use tokio::sync::mpsc;
@@ -82,7 +84,9 @@ async fn main() -> Result<()> {
         run_non_interactive(cli, &prompt, session_id, restore).await
     } else {
         let mut terminal = ratatui::init();
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
         let result = run_interactive(&mut terminal, cli, &session_id, restore).await;
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)?;
         ratatui::restore();
         eprintln!("\nTo resume this session:\n  asobi --restore {session_id}");
         result
@@ -153,6 +157,12 @@ async fn run_interactive(
     let mut app = App::new();
     let mut event_stream = EventStream::new();
 
+    if restore
+        && let Ok(messages) = history::load(session_id).await
+    {
+        app.load_history(&messages);
+    }
+
     let (user_tx, mut user_rx) = mpsc::unbounded_channel::<String>();
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<agent::AgentEvent>();
 
@@ -189,35 +199,60 @@ async fn run_interactive(
                         } else {
                             app.reset_quit_pending();
 
-                            if app.is_streaming {
-                            } else if ctrl {
-                                match key.code {
-                                    KeyCode::Char('h') => app.delete_char(),
-                                    KeyCode::Char('u') => app.clear_input(),
-                                    _ => {}
-                                }
-                            } else {
-                                match key.code {
-                                    KeyCode::Enter => {
-                                        let input = app.take_input();
-                                        if input.trim() == "/quit" {
-                                            break;
-                                        } else if !input.trim().is_empty() {
-                                            app.chat.push(app::ChatEntry::User(input.clone()));
-                                            app.is_streaming = true;
-                                            let _ = user_tx.send(input);
-                                        }
+                            match key.code {
+                                KeyCode::Tab => app.toggle_focus(),
+                                KeyCode::Esc => app.focus = app::Focus::Input,
+                                _ if app.focus == app::Focus::Chat => {
+                                    match key.code {
+                                        KeyCode::Up => app.scroll_up(),
+                                        KeyCode::Down => app.scroll_down(),
+                                        KeyCode::PageUp => app.scroll_up(),
+                                        KeyCode::PageDown => app.scroll_down(),
+                                        _ => {}
                                     }
-                                    KeyCode::Char(c) => app.insert_char(c),
-                                    KeyCode::Backspace => app.delete_char(),
-                                    KeyCode::Left => app.move_cursor_left(),
-                                    KeyCode::Right => app.move_cursor_right(),
-                                    KeyCode::Up => app.scroll_up(),
-                                    KeyCode::Down => app.scroll_down(),
-                                    _ => {}
+                                }
+                                _ if ctrl => {
+                                    match key.code {
+                                        KeyCode::Char('h') => app.delete_char(),
+                                        KeyCode::Char('u') => app.clear_input(),
+                                        _ => {}
+                                    }
+                                }
+                                _ => {
+                                    match key.code {
+                                        KeyCode::Enter => {
+                                            let input = app.take_input();
+                                            if input.trim() == "/quit" {
+                                                break;
+                                            } else if !input.trim().is_empty() {
+                                                app.chat.push(app::ChatEntry::User(input.clone()));
+                                                app.is_streaming = true;
+                                                let _ = user_tx.send(input);
+                                            }
+                                        }
+                                        KeyCode::Char(c) => app.insert_char(c),
+                                        KeyCode::Backspace => app.delete_char(),
+                                        KeyCode::Left => app.move_cursor_left(),
+                                        KeyCode::Right => app.move_cursor_right(),
+                                        KeyCode::Up => app.history_prev(),
+                                        KeyCode::Down => app.history_next(),
+                                        KeyCode::PageUp => app.scroll_up(),
+                                        KeyCode::PageDown => app.scroll_down(),
+                                        _ => {}
+                                    }
                                 }
                             }
                         }
+                    }
+                    Event::Mouse(mouse) => {
+                        match mouse.kind {
+                            MouseEventKind::ScrollUp => app.scroll_up(),
+                            MouseEventKind::ScrollDown => app.scroll_down(),
+                            _ => {}
+                        }
+                    }
+                    Event::Resize(_, _) => {
+                        app.on_resize();
                     }
                     _ => {}
                 }

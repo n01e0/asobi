@@ -68,10 +68,19 @@ impl Agent {
             .role(ConversationRole::User)
             .content(ContentBlock::Text(user_input.to_string()))
             .build()
-            .unwrap();
-        self.messages.push(user_msg);
+            .context("failed to build user message");
+
+        match user_msg {
+            Ok(msg) => self.messages.push(msg),
+            Err(e) => {
+                let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
+                let _ = tx.send(AgentEvent::TurnEnd);
+                return;
+            }
+        }
 
         if let Err(e) = self.run_loop(tx.clone()).await {
+            self.messages.pop();
             let _ = tx.send(AgentEvent::Error(format!("{e:#}")));
         }
         let _ = history::save(&self.session_id, &self.messages).await;
@@ -90,11 +99,16 @@ impl Agent {
                 assistant_content.push(ContentBlock::ToolUse(tu.clone()));
             }
 
+            if assistant_content.is_empty() {
+                break;
+            }
+
             let mut builder = Message::builder().role(ConversationRole::Assistant);
             for content in assistant_content {
                 builder = builder.content(content);
             }
-            self.messages.push(builder.build().unwrap());
+            self.messages
+                .push(builder.build().context("failed to build assistant message")?);
 
             if tool_uses.is_empty() {
                 break;
@@ -129,7 +143,11 @@ impl Agent {
                 tool_result_builder =
                     tool_result_builder.content(ContentBlock::ToolResult(result));
             }
-            self.messages.push(tool_result_builder.build().unwrap());
+            self.messages.push(
+                tool_result_builder
+                    .build()
+                    .context("failed to build tool result message")?,
+            );
         }
         Ok(())
     }
@@ -141,7 +159,7 @@ impl Agent {
         let tool_config = ToolConfiguration::builder()
             .set_tools(Some(tools::tool_definitions()))
             .build()
-            .unwrap();
+            .context("failed to build tool configuration")?;
 
         let mut request = self
             .client
@@ -191,15 +209,19 @@ impl Agent {
                         }
                         ConverseStreamOutput::ContentBlockStop(_) => {
                             if !current_tool_name.is_empty() {
-                                let input_doc = serde_json::from_str::<serde_json::Value>(&current_tool_input)
-                                    .map(|v| json_value_to_document(&v))
-                                    .unwrap_or(Document::Null);
+                                let empty_object =
+                                    Document::Object(std::collections::HashMap::new());
+                                let input_doc = serde_json::from_str::<serde_json::Value>(
+                                    &current_tool_input,
+                                )
+                                .map(|v| json_value_to_document(&v))
+                                .unwrap_or(empty_object);
                                 let tool_use = ToolUseBlock::builder()
                                     .tool_use_id(current_tool_id.clone())
                                     .name(current_tool_name.clone())
                                     .input(input_doc)
                                     .build()
-                                    .unwrap();
+                                    .context("failed to build tool use block")?;
                                 tool_uses.push(tool_use);
                                 current_tool_name.clear();
                                 current_tool_id.clear();
@@ -256,9 +278,10 @@ fn document_to_json_value(doc: &Document) -> serde_json::Value {
         Document::Number(n) => match n {
             aws_smithy_types::Number::PosInt(i) => serde_json::json!(*i),
             aws_smithy_types::Number::NegInt(i) => serde_json::json!(*i),
-            aws_smithy_types::Number::Float(f) => {
-                serde_json::Value::Number(serde_json::Number::from_f64(*f).unwrap_or_else(|| serde_json::Number::from(0)))
-            }
+            aws_smithy_types::Number::Float(f) => serde_json::Value::Number(
+                serde_json::Number::from_f64(*f)
+                    .unwrap_or_else(|| serde_json::Number::from(0)),
+            ),
         },
         Document::String(s) => serde_json::Value::String(s.clone()),
         Document::Array(arr) => {

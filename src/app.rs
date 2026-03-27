@@ -1,3 +1,7 @@
+use aws_sdk_bedrockruntime::types::{ContentBlock, ConversationRole, Message};
+
+use unicode_width::UnicodeWidthStr;
+
 use crate::agent::AgentEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout},
@@ -6,6 +10,12 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Focus {
+    Input,
+    Chat,
+}
 
 #[derive(Debug, Clone)]
 pub enum ChatEntry {
@@ -26,6 +36,11 @@ pub struct App {
     pub content_height: u16,
     pub viewport_height: u16,
     quit_pending: bool,
+    autoscroll: bool,
+    pub focus: Focus,
+    input_history: Vec<String>,
+    history_index: Option<usize>,
+    saved_input: String,
 }
 
 impl App {
@@ -40,7 +55,32 @@ impl App {
             content_height: 0,
             viewport_height: 0,
             quit_pending: false,
+            autoscroll: true,
+            focus: Focus::Input,
+            input_history: Vec::new(),
+            history_index: None,
+            saved_input: String::new(),
         }
+    }
+
+    pub fn load_history(&mut self, messages: &[Message]) {
+        for msg in messages {
+            let role = msg.role();
+            for block in msg.content() {
+                if let ContentBlock::Text(text) = block {
+                    match role {
+                        ConversationRole::User => {
+                            self.chat.push(ChatEntry::User(text.clone()));
+                        }
+                        ConversationRole::Assistant => {
+                            self.chat.push(ChatEntry::AssistantText(text.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.autoscroll = true;
     }
 
     pub fn request_quit(&mut self) -> bool {
@@ -59,16 +99,13 @@ impl App {
         match event {
             AgentEvent::Text(text) => {
                 self.streaming_text.push_str(&text);
-                self.scroll_to_bottom();
             }
             AgentEvent::ToolCall { name, input } => {
                 self.flush_streaming();
                 self.chat.push(ChatEntry::ToolCall { name, input });
-                self.scroll_to_bottom();
             }
             AgentEvent::ToolResult { name, output } => {
                 self.chat.push(ChatEntry::ToolResult { name, output });
-                self.scroll_to_bottom();
             }
             AgentEvent::TurnEnd => {
                 self.flush_streaming();
@@ -108,7 +145,13 @@ impl App {
 
     pub fn take_input(&mut self) -> String {
         self.cursor_pos = 0;
-        std::mem::take(&mut self.input)
+        self.history_index = None;
+        self.saved_input.clear();
+        let input = std::mem::take(&mut self.input);
+        if !input.trim().is_empty() {
+            self.input_history.push(input.clone());
+        }
+        input
     }
 
     pub fn clear_input(&mut self) {
@@ -116,17 +159,61 @@ impl App {
         self.cursor_pos = 0;
     }
 
+    pub fn history_prev(&mut self) {
+        if self.input_history.is_empty() {
+            return;
+        }
+        let idx = match self.history_index {
+            None => {
+                self.saved_input = self.input.clone();
+                self.input_history.len() - 1
+            }
+            Some(0) => return,
+            Some(i) => i - 1,
+        };
+        self.history_index = Some(idx);
+        self.input = self.input_history[idx].clone();
+        self.cursor_pos = self.input.len();
+    }
+
+    pub fn history_next(&mut self) {
+        let idx = match self.history_index {
+            None => return,
+            Some(i) => i,
+        };
+        if idx + 1 >= self.input_history.len() {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.saved_input);
+        } else {
+            self.history_index = Some(idx + 1);
+            self.input = self.input_history[idx + 1].clone();
+        }
+        self.cursor_pos = self.input.len();
+    }
+
+    pub fn on_resize(&mut self) {
+        // autoscrollがtrueなら次のrender時に追従する
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Input => Focus::Chat,
+            Focus::Chat => Focus::Input,
+        };
+    }
+
     pub fn scroll_up(&mut self) {
+        self.autoscroll = false;
         self.scroll_offset = self.scroll_offset.saturating_sub(3);
     }
 
     pub fn scroll_down(&mut self) {
         self.scroll_offset = self.scroll_offset.saturating_add(3);
         self.clamp_scroll();
-    }
-
-    fn scroll_to_bottom(&mut self) {
-        self.scroll_offset = self.content_height.saturating_sub(self.viewport_height);
+        let max = self.content_height.saturating_sub(self.viewport_height);
+        if self.scroll_offset >= max {
+            self.autoscroll = true;
+        }
     }
 
     fn clamp_scroll(&mut self) {
@@ -242,10 +329,20 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 
     app.content_height = lines.len() as u16;
 
+    if app.autoscroll {
+        app.scroll_offset = app.content_height.saturating_sub(app.viewport_height);
+    }
+
+    let chat_border = if app.focus == Focus::Chat {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let chat_widget = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(chat_border)
                 .title(" asobi "),
         )
         .wrap(Wrap { trim: false })
@@ -259,15 +356,21 @@ pub fn render(app: &mut App, frame: &mut Frame) {
     } else {
         " > "
     };
+    let input_border = if app.focus == Focus::Input {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let input_widget = Paragraph::new(app.input.as_str()).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_style(input_border)
             .title(input_title),
     );
     frame.render_widget(input_widget, input_area);
 
-    if !app.is_streaming {
-        let cursor_x = input_area.x + 1 + app.input[..app.cursor_pos].chars().count() as u16;
+    if app.focus == Focus::Input {
+        let cursor_x = input_area.x + 1 + app.input[..app.cursor_pos].width() as u16;
         let cursor_y = input_area.y + 1;
         frame.set_cursor_position((cursor_x, cursor_y));
     }
@@ -434,5 +537,87 @@ mod tests {
         app.clear_input();
         assert_eq!(app.input, "");
         assert_eq!(app.cursor_pos, 0);
+    }
+
+    #[test]
+    fn test_input_history_navigation() {
+        let mut app = App::new();
+
+        app.input = "first".into();
+        app.cursor_pos = 5;
+        app.take_input();
+
+        app.input = "second".into();
+        app.cursor_pos = 6;
+        app.take_input();
+
+        app.input = "third".into();
+        app.cursor_pos = 5;
+        app.take_input();
+
+        assert_eq!(app.input, "");
+
+        app.history_prev();
+        assert_eq!(app.input, "third");
+        app.history_prev();
+        assert_eq!(app.input, "second");
+        app.history_prev();
+        assert_eq!(app.input, "first");
+        app.history_prev();
+        assert_eq!(app.input, "first");
+
+        app.history_next();
+        assert_eq!(app.input, "second");
+        app.history_next();
+        assert_eq!(app.input, "third");
+        app.history_next();
+        assert_eq!(app.input, "");
+        app.history_next();
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn test_input_history_preserves_draft() {
+        let mut app = App::new();
+
+        app.input = "old".into();
+        app.cursor_pos = 3;
+        app.take_input();
+
+        app.input = "drafting".into();
+        app.cursor_pos = 8;
+
+        app.history_prev();
+        assert_eq!(app.input, "old");
+
+        app.history_next();
+        assert_eq!(app.input, "drafting");
+    }
+
+    #[test]
+    fn test_input_history_empty() {
+        let mut app = App::new();
+        app.history_prev();
+        assert_eq!(app.input, "");
+        app.history_next();
+        assert_eq!(app.input, "");
+    }
+
+    #[test]
+    fn test_take_input_adds_to_history() {
+        let mut app = App::new();
+        app.input = "hello".into();
+        app.cursor_pos = 5;
+        app.take_input();
+        assert_eq!(app.input_history, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_take_input_skips_empty() {
+        let mut app = App::new();
+        app.input = "   ".into();
+        app.cursor_pos = 3;
+        app.take_input();
+        assert!(app.input_history.is_empty());
     }
 }

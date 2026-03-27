@@ -149,7 +149,7 @@ fn entry_to_message(entry: &HistoryEntry) -> Option<Message> {
             }
         }
     }
-    Some(builder.build().unwrap())
+    builder.build().ok()
 }
 
 #[cfg(test)]

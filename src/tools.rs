@@ -47,7 +47,7 @@ fn read_file_def() -> Tool {
             .description("Read the contents of a file")
             .input_schema(ToolInputSchema::Json(schema))
             .build()
-            .unwrap(),
+            .expect("static tool definition"),
     )
 }
 
@@ -65,7 +65,7 @@ fn write_file_def() -> Tool {
             .description("Write content to a file, creating it if it doesn't exist")
             .input_schema(ToolInputSchema::Json(schema))
             .build()
-            .unwrap(),
+            .expect("static tool definition"),
     )
 }
 
@@ -83,7 +83,7 @@ fn run_command_def() -> Tool {
             .description("Execute a shell command and return its stdout and stderr")
             .input_schema(ToolInputSchema::Json(schema))
             .build()
-            .unwrap(),
+            .expect("static tool definition"),
     )
 }
 
@@ -101,7 +101,7 @@ fn list_files_def() -> Tool {
             .description("List files and directories in the specified path")
             .input_schema(ToolInputSchema::Json(schema))
             .build()
-            .unwrap(),
+            .expect("static tool definition"),
     )
 }
 
@@ -124,18 +124,35 @@ pub async fn execute_tool(name: &str, tool_use_id: &str, input: &Document) -> To
         _ => Err(anyhow::anyhow!("unknown tool: {name}")),
     };
 
-    match result {
-        Ok(output) => ToolResultBlock::builder()
-            .tool_use_id(tool_use_id)
-            .content(ToolResultContentBlock::Text(output))
-            .build()
-            .unwrap(),
-        Err(e) => ToolResultBlock::builder()
-            .tool_use_id(tool_use_id)
-            .content(ToolResultContentBlock::Text(format!("Error: {e:#}")))
-            .status(aws_sdk_bedrockruntime::types::ToolResultStatus::Error)
-            .build()
-            .unwrap(),
+    let (text, status) = match result {
+        Ok(output) => (output, None),
+        Err(e) => (
+            format!("Error: {e:#}"),
+            Some(aws_sdk_bedrockruntime::types::ToolResultStatus::Error),
+        ),
+    };
+
+    let mut builder = ToolResultBlock::builder()
+        .tool_use_id(tool_use_id)
+        .content(ToolResultContentBlock::Text(text.clone()));
+    if let Some(s) = status {
+        builder = builder.status(s);
+    }
+
+    match builder.build() {
+        Ok(block) => block,
+        Err(e) => {
+            // tool_use_id + content が揃っている以上ここには到達しないが、
+            // 万一の場合はエラー内容をテキストとして返す
+            ToolResultBlock::builder()
+                .tool_use_id(tool_use_id)
+                .content(ToolResultContentBlock::Text(format!(
+                    "Internal error building tool result: {e}"
+                )))
+                .status(aws_sdk_bedrockruntime::types::ToolResultStatus::Error)
+                .build()
+                .expect("fallback tool result with all required fields")
+        }
     }
 }
 

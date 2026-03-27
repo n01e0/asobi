@@ -121,13 +121,17 @@ asobi --system-prompt "You are a Rust expert. Always prefer idiomatic Rust."
 | Key | Action |
 |-----|--------|
 | `Enter` | Send message |
+| `Tab` | Toggle focus between input and chat |
+| `Esc` | Return focus to input |
 | `Ctrl+C` (x2) | Quit |
 | `Ctrl+D` (x2) | Quit |
 | `Ctrl+H` | Delete character (same as Backspace) |
 | `Ctrl+U` | Clear input line |
-| `Up/Down` | Scroll chat history |
+| `Up/Down` | Browse input history (input focus) / Scroll (chat focus) |
+| `PageUp/PageDown` | Scroll chat history |
 | `Left/Right` | Move cursor in input |
 | `Backspace` | Delete character |
+| Mouse scroll | Scroll chat history |
 
 Type `/quit` and press Enter to exit.
 
