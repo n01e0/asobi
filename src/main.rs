@@ -225,7 +225,16 @@ async fn run_interactive(
     loop {
         terminal.draw(|frame| app::render(&mut app, frame))?;
 
+        // agent_rxを先にdrainしてからターミナルイベントを処理
+        while let Ok(event) = agent_rx.try_recv() {
+            app.handle_agent_event(event);
+        }
+
         tokio::select! {
+            biased;
+            Some(event) = agent_rx.recv() => {
+                app.handle_agent_event(event);
+            }
             Some(Ok(event)) = event_stream.next() => {
                 match event {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -295,9 +304,6 @@ async fn run_interactive(
                     }
                     _ => {}
                 }
-            }
-            Some(event) = agent_rx.recv() => {
-                app.handle_agent_event(event);
             }
         }
     }

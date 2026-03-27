@@ -85,8 +85,8 @@ impl WasmTool {
         let instance = linker.instantiate(&mut store, &self.module)?;
 
         let alloc_fn = instance
-            .get_typed_func::<i32, i32>(&mut store, "alloc")
-            .map_err(|e| anyhow::anyhow!("WASM must export `alloc(i32) -> i32`: {e}"))?;
+            .get_typed_func::<i32, i32>(&mut store, "alloc_mem")
+            .map_err(|e| anyhow::anyhow!("WASM must export `alloc_mem(i32) -> i32`: {e}"))?;
 
         let input_bytes = input_json.as_bytes();
         let input_ptr = alloc_fn.call(&mut store, input_bytes.len() as i32)?;
@@ -174,5 +174,64 @@ mod tests {
     fn test_resolve_wasm_path_relative() {
         let result = resolve_wasm_path("plugins/tool.wasm", Path::new("/home/user/.asobi"));
         assert_eq!(result, PathBuf::from("/home/user/.asobi/plugins/tool.wasm"));
+    }
+
+    fn wasm_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/sandboxed_exec.wasm")
+    }
+
+    #[test]
+    fn test_load_sandboxed_exec_plugin() {
+        let path = wasm_path();
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not found");
+            return;
+        }
+        let cfg = WasmToolConfig {
+            name: "sandboxed_exec".to_string(),
+            wasm: path.to_str().unwrap().to_string(),
+            description: None,
+            permissions: Default::default(),
+        };
+        let tool = WasmTool::load(&cfg, Path::new(".")).unwrap();
+        assert_eq!(tool.name, "sandboxed_exec");
+        assert!(tool.description.contains("sandbox"));
+        assert!(tool.schema.get("properties").is_some());
+    }
+
+    #[test]
+    fn test_execute_sandboxed_exec_ls() {
+        let path = wasm_path();
+        if !path.exists() {
+            eprintln!("skipping: {path:?} not found");
+            return;
+        }
+
+        let test_dir = std::env::temp_dir().join("asobi_wasm_test_exec");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        std::fs::write(test_dir.join("hello.txt"), "hello wasm").unwrap();
+
+        let cfg = WasmToolConfig {
+            name: "sandboxed_exec".to_string(),
+            wasm: path.to_str().unwrap().to_string(),
+            description: None,
+            permissions: crate::config::WasmPermissions {
+                fs_read: vec![test_dir.to_str().unwrap().to_string()],
+                fs_write: vec![],
+                env: vec![],
+            },
+        };
+        let tool = WasmTool::load(&cfg, Path::new(".")).unwrap();
+
+        let input = serde_json::json!({
+            "code": format!("ls {}\nread {}/hello.txt", test_dir.display(), test_dir.display())
+        });
+        let result = tool.execute(&input.to_string()).unwrap();
+        eprintln!("output: {result}");
+        assert!(result.contains("hello.txt"));
+        assert!(result.contains("hello wasm"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }
