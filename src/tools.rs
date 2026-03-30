@@ -7,18 +7,20 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::config::WasmToolConfig;
+use crate::config::{Permissions, WasmToolConfig};
 use crate::wasm_tool::WasmTool;
 
 pub struct ToolRegistry {
     wasm_tools: HashMap<String, Arc<WasmTool>>,
+    permissions: Permissions,
 }
 
 impl ToolRegistry {
-    pub fn new(wasm_configs: &[WasmToolConfig], base_dir: &Path) -> Self {
+    pub fn new(wasm_configs: &[WasmToolConfig], base_dir: &Path, permissions: Permissions) -> Self {
         let mut wasm_tools = HashMap::new();
         for cfg in wasm_configs {
-            match WasmTool::load(cfg, base_dir) {
+            let resolved_cfg = cfg.clone();
+            match WasmTool::load(&resolved_cfg, base_dir) {
                 Ok(tool) => {
                     eprintln!("[plugin] loaded: {}", tool.name);
                     wasm_tools.insert(tool.name.clone(), Arc::new(tool));
@@ -28,7 +30,10 @@ impl ToolRegistry {
                 }
             }
         }
-        Self { wasm_tools }
+        Self {
+            wasm_tools,
+            permissions,
+        }
     }
 
     pub fn tool_definitions(&self) -> Vec<Tool> {
@@ -54,10 +59,38 @@ impl ToolRegistry {
         input: &Document,
     ) -> ToolResultBlock {
         let result = match name {
-            "read_file" => exec_read_file(input).await,
-            "write_file" => exec_write_file(input).await,
-            "run_command" => exec_run_command(input).await,
-            "list_files" => exec_list_files(input).await,
+            "read_file" => {
+                let path = get_string_param(input, "path").unwrap_or_default();
+                if !self.permissions.is_path_readable(path) {
+                    Err(anyhow::anyhow!("permission denied: read {path}"))
+                } else {
+                    exec_read_file(input).await
+                }
+            }
+            "write_file" => {
+                let path = get_string_param(input, "path").unwrap_or_default();
+                if !self.permissions.is_path_writable(path) {
+                    Err(anyhow::anyhow!("permission denied: write {path}"))
+                } else {
+                    exec_write_file(input).await
+                }
+            }
+            "run_command" => {
+                let cmd = get_string_param(input, "command").unwrap_or_default();
+                if !self.permissions.is_command_allowed(cmd) {
+                    Err(anyhow::anyhow!("permission denied: command {cmd}"))
+                } else {
+                    exec_run_command(input).await
+                }
+            }
+            "list_files" => {
+                let path = get_string_param(input, "path").unwrap_or(".");
+                if !self.permissions.is_path_readable(path) {
+                    Err(anyhow::anyhow!("permission denied: list {path}"))
+                } else {
+                    exec_list_files(input).await
+                }
+            }
             _ => {
                 if let Some(wasm_tool) = self.wasm_tools.get(name) {
                     let input_json = document_to_json_string(input);
@@ -417,7 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registry_execute_unknown() {
-        let registry = ToolRegistry::new(&[], Path::new("."));
+        let registry = ToolRegistry::new(&[], Path::new("."), Permissions::default());
         let input = Document::Object(HashMap::new());
         let result = registry.execute_tool("nonexistent", "id-1", &input).await;
         assert_eq!(
@@ -428,7 +461,7 @@ mod tests {
 
     #[test]
     fn test_registry_definitions_include_builtins() {
-        let registry = ToolRegistry::new(&[], Path::new("."));
+        let registry = ToolRegistry::new(&[], Path::new("."), Permissions::default());
         let defs = registry.tool_definitions();
         assert!(defs.len() >= 4);
     }

@@ -132,14 +132,14 @@ fn build_wasi_ctx(cfg: &WasmToolConfig) -> Result<WasiP1Ctx> {
     let mut builder = WasiCtxBuilder::new();
     builder.inherit_stdio();
 
-    for path in &cfg.permissions.fs_read {
+    for mount in cfg.permissions.resolved_mounts() {
+        let (dir_perms, file_perms) = if mount.writable {
+            (DirPerms::all(), FilePerms::all())
+        } else {
+            (DirPerms::READ, FilePerms::READ)
+        };
         builder
-            .preopened_dir(path, path, DirPerms::READ, FilePerms::READ)?;
-    }
-
-    for path in &cfg.permissions.fs_write {
-        builder
-            .preopened_dir(path, path, DirPerms::all(), FilePerms::all())?;
+            .preopened_dir(&mount.host_path, &mount.guest_path, dir_perms, file_perms)?;
     }
 
     for key in &cfg.permissions.env {
@@ -176,62 +176,140 @@ mod tests {
         assert_eq!(result, PathBuf::from("/home/user/.asobi/plugins/tool.wasm"));
     }
 
-    fn wasm_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("plugins/sandboxed_exec.wasm")
+    fn plugin_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("plugins/{name}.wasm"))
     }
 
-    #[test]
-    fn test_load_sandboxed_exec_plugin() {
-        let path = wasm_path();
+    fn load_plugin(name: &str, mount_dirs: &[&str]) -> Option<WasmTool> {
+        let path = plugin_path(name);
         if !path.exists() {
             eprintln!("skipping: {path:?} not found");
-            return;
+            return None;
         }
         let cfg = WasmToolConfig {
-            name: "sandboxed_exec".to_string(),
-            wasm: path.to_str().unwrap().to_string(),
-            description: None,
-            permissions: Default::default(),
-        };
-        let tool = WasmTool::load(&cfg, Path::new(".")).unwrap();
-        assert_eq!(tool.name, "sandboxed_exec");
-        assert!(tool.description.contains("sandbox"));
-        assert!(tool.schema.get("properties").is_some());
-    }
-
-    #[test]
-    fn test_execute_sandboxed_exec_ls() {
-        let path = wasm_path();
-        if !path.exists() {
-            eprintln!("skipping: {path:?} not found");
-            return;
-        }
-
-        let test_dir = std::env::temp_dir().join("asobi_wasm_test_exec");
-        let _ = std::fs::remove_dir_all(&test_dir);
-        std::fs::create_dir_all(&test_dir).unwrap();
-        std::fs::write(test_dir.join("hello.txt"), "hello wasm").unwrap();
-
-        let cfg = WasmToolConfig {
-            name: "sandboxed_exec".to_string(),
+            name: name.to_string(),
             wasm: path.to_str().unwrap().to_string(),
             description: None,
             permissions: crate::config::WasmPermissions {
-                fs_read: vec![test_dir.to_str().unwrap().to_string()],
-                fs_write: vec![],
+                mounts: mount_dirs.iter().map(|s| s.to_string()).collect(),
                 env: vec![],
             },
         };
-        let tool = WasmTool::load(&cfg, Path::new(".")).unwrap();
+        Some(WasmTool::load(&cfg, Path::new(".")).unwrap())
+    }
+
+    #[test]
+    fn test_edit_file_replace() {
+        let dir = std::env::temp_dir().join("asobi_wasm_test_edit");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.rs");
+        std::fs::write(&file, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+
+        let Some(tool) = load_plugin("edit_file", &[dir.to_str().unwrap()]) else { return };
 
         let input = serde_json::json!({
-            "code": format!("ls {}\nread {}/hello.txt", test_dir.display(), test_dir.display())
+            "path": file.to_str().unwrap(),
+            "old_string": "    println!(\"hello\");",
+            "new_string": "    println!(\"world\");"
         });
         let result = tool.execute(&input.to_string()).unwrap();
-        eprintln!("output: {result}");
-        assert!(result.contains("hello.txt"));
-        assert!(result.contains("hello wasm"));
+        assert!(result.contains("replaced 1 occurrence"));
 
-        let _ = std::fs::remove_dir_all(&test_dir);
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("println!(\"world\")"));
+        assert!(!content.contains("println!(\"hello\")"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_edit_file_not_found() {
+        let dir = std::env::temp_dir().join("asobi_wasm_test_edit_nf");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "aaa bbb ccc").unwrap();
+
+        let Some(tool) = load_plugin("edit_file", &[dir.to_str().unwrap()]) else { return };
+
+        let input = serde_json::json!({
+            "path": file.to_str().unwrap(),
+            "old_string": "zzz",
+            "new_string": "yyy"
+        });
+        let result = tool.execute(&input.to_string()).unwrap();
+        assert!(result.contains("not found"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_edit_file_ambiguous() {
+        let dir = std::env::temp_dir().join("asobi_wasm_test_edit_amb");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "foo bar foo baz foo").unwrap();
+
+        let Some(tool) = load_plugin("edit_file", &[dir.to_str().unwrap()]) else { return };
+
+        let input = serde_json::json!({
+            "path": file.to_str().unwrap(),
+            "old_string": "foo",
+            "new_string": "qux"
+        });
+        let result = tool.execute(&input.to_string()).unwrap();
+        assert!(result.contains("ambiguous"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_patch_file_apply() {
+        let dir = std::env::temp_dir().join("asobi_wasm_test_patch");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "line1\nline2\nline3\nline4\n").unwrap();
+
+        let Some(tool) = load_plugin("patch_file", &[dir.to_str().unwrap()]) else { return };
+
+        let patch = "@@ -2,2 +2,2 @@\n-line2\n-line3\n+LINE2\n+LINE3";
+        let input = serde_json::json!({
+            "path": file.to_str().unwrap(),
+            "patch": patch
+        });
+        let result = tool.execute(&input.to_string()).unwrap();
+        eprintln!("patch result: {result}");
+        assert!(result.contains("applied 1 hunk"));
+
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("LINE2"));
+        assert!(content.contains("LINE3"));
+        assert!(!content.contains("line2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_patch_file_context_mismatch() {
+        let dir = std::env::temp_dir().join("asobi_wasm_test_patch_mm");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(&file, "aaa\nbbb\nccc\n").unwrap();
+
+        let Some(tool) = load_plugin("patch_file", &[dir.to_str().unwrap()]) else { return };
+
+        let patch = "@@ -1,2 +1,2 @@\n-aaa\n-zzz\n+aaa\n+yyy";
+        let input = serde_json::json!({
+            "path": file.to_str().unwrap(),
+            "patch": patch
+        });
+        let result = tool.execute(&input.to_string()).unwrap();
+        assert!(result.contains("mismatch") || result.contains("Error"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

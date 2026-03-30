@@ -48,6 +48,10 @@ struct Cli {
     /// Restore a specific session by ID
     #[arg(long)]
     restore: Option<String>,
+
+    /// Load a WASM tool plugin (format: name:path.wasm, repeatable)
+    #[arg(short = 't', long = "tool", value_name = "NAME:PATH")]
+    tools: Vec<String>,
 }
 
 struct ResolvedConfig {
@@ -107,13 +111,32 @@ impl Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::load();
+    let (cfg, permissions, mut all_tools) = config::load_merged()
+        .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
     let resolved = ResolvedConfig::from_cli_and_config(&cli, &cfg);
     let prompt = cli.resolve_prompt()?;
     let (session_id, restore) = cli.resolve_session()?;
 
     let base_dir = config::config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    let registry = Arc::new(tools::ToolRegistry::new(&cfg.tools, &base_dir));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    for spec in &cli.tools {
+        if let Some((name, path)) = spec.split_once(':') {
+            let abs_path = if std::path::Path::new(path).is_absolute() {
+                path.to_string()
+            } else {
+                cwd.join(path).to_string_lossy().to_string()
+            };
+            all_tools.push(config::WasmToolConfig {
+                name: name.to_string(),
+                wasm: abs_path,
+                description: None,
+                permissions: Default::default(),
+            });
+        } else {
+            eprintln!("[warn] invalid --tool format: {spec} (expected name:path.wasm)");
+        }
+    }
+    let registry = Arc::new(tools::ToolRegistry::new(&all_tools, &base_dir, permissions));
 
     if let Some(prompt) = prompt {
         run_non_interactive(resolved, &prompt, session_id, restore, Arc::clone(&registry)).await
@@ -365,6 +388,7 @@ mod tests {
             prompt_file: None,
             r#continue: false,
             restore: None,
+            tools: vec![],
         }
     }
 
